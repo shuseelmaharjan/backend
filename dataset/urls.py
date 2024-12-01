@@ -4,6 +4,7 @@ from .views import *
 
 urlpatterns = [
     path('datasets/', DatasetCreateView.as_view(), name='dataset-create'),
-    path('recommend/', MovieRecommendView.as_view(), name='movie-recommend'),
-    path('suggest/', MovieSuggestView.as_view(), name='movie-suggest'),
+    path('movies/', MovieRecommendationView.as_view(), name='movie-recommendations'),
+    path('suggestion/', MovieSuggestView.as_view(), name='movie-recommendations'),
+    path('dataset/', MovieListView.as_view(), name='list-movies-from-datasets'),
 ]

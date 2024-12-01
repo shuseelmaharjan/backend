@@ -6,7 +6,12 @@ from .serializers import *
 import pandas as pd
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.feature_extraction.text import TfidfVectorizer
-
+from django.views import View
+from django.http import JsonResponse
+from django.shortcuts import get_object_or_404
+import csv
+import requests
+import json
 
 class DatasetCreateView(APIView):
     def post(self, request, *args, **kwargs):
@@ -22,110 +27,198 @@ class DatasetCreateView(APIView):
         return Response(serializer.data, status=status.HTTP_200_OK)
 
 
-class MovieRecommendView(APIView):
+class MovieRecommendationView(APIView):
     def get(self, request, *args, **kwargs):
-        """
-        API to recommend movies based on content similarity (using title, cast, crew).
-        """
-        # Extract the query parameter for the movie title
-        movie_title = request.query_params.get('title', None)
+        # Ensure a movie ID is passed in the query params
+        movie_id = request.query_params.get('movie_id')
+        if not movie_id:
+            return Response({"error": "movie_id query parameter is required."}, status=status.HTTP_400_BAD_REQUEST)
 
-        # Validate that the movie title is provided
-        if not movie_title:
-            return Response({"error": "Movie title is required as a query parameter."}, status=status.HTTP_400_BAD_REQUEST)
+        # Get the dataset file
+        dataset_obj = Dataset.objects.first()
+        if not dataset_obj:
+            return Response({"error": "Dataset not found."}, status=status.HTTP_404_NOT_FOUND)
 
+        # Load the dataset CSV
+        file_path = dataset_obj.file.path
         try:
-            # Fetch all datasets from the database
-            datasets = Dataset.objects.all()
-            recommendations = []
-
-            for dataset in datasets:
-                dataset_path = dataset.file.path  # Get the full file path for each dataset
-                try:
-                    # Generate recommendations for the current dataset
-                    recs = self.get_movie_recommendations(movie_title, dataset_path)
-                    if recs:
-                        recommendations.extend(recs)
-                except Exception as e:
-                    continue  # Skip datasets that may cause errors but continue with the rest
-
-            # Return unique recommendations, if any
-            if recommendations:
-                return Response({"recommendations": list(set(recommendations))}, status=status.HTTP_200_OK)
-            else:
-                return Response({"error": "No recommendations found."}, status=status.HTTP_404_NOT_FOUND)
-
+            df = pd.read_csv(file_path)
         except Exception as e:
-            return Response({"error": f"An error occurred: {str(e)}"}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({"error": f"Failed to load dataset: {str(e)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-    def get_movie_recommendations(self, movie_title, dataset_path):
+        # Validate required columns
+        required_columns = {'movie_id', 'title', 'cast', 'crew'}
+        if not required_columns.issubset(df.columns):
+            return Response({"error": f"Dataset must contain columns: {required_columns}"}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Combine relevant fields into a single text column
+        df['combined'] = df['title'].fillna('') + ' ' + df['cast'].fillna('') + ' ' + df['crew'].fillna('')
+
+        # Check if movie_id exists in the dataset
+        if movie_id not in df['movie_id'].astype(str).values:
+            return Response({"error": f"Movie ID {movie_id} not found in the dataset."}, status=status.HTTP_404_NOT_FOUND)
+
+        # Vectorize the combined text
+        tfidf = TfidfVectorizer(stop_words='english')
+        tfidf_matrix = tfidf.fit_transform(df['combined'])
+
+        # Calculate cosine similarity
+        cosine_sim = cosine_similarity(tfidf_matrix)
+
+        # Find the index of the given movie_id
+        movie_idx = df[df['movie_id'] == int(movie_id)].index[0]
+
+        # Get similarity scores for the given movie
+        sim_scores = list(enumerate(cosine_sim[movie_idx]))
+        sim_scores = sorted(sim_scores, key=lambda x: x[1], reverse=True)
+
+        # Retrieve top recommendations (excluding the movie itself)
+        top_recommendations = sim_scores[1:6]  # Top 5 similar movies
+        recommendations = []
+        for idx, score in top_recommendations:
+            recommendations.append({
+                "movie_id": df.iloc[idx]['movie_id'],
+                "title": df.iloc[idx]['title'],
+                "similarity_score": score
+            })
+
+        # Return recommendations
+        return Response({"movie_id": movie_id, "recommendations": recommendations}, status=status.HTTP_200_OK)
+
+class MovieListView(APIView):
+    def get(self, request):
         """
-        Generate movie recommendations based on the cosine similarity of the movie title, cast, and crew.
+        Handle GET requests to fetch movie data (movie_id, title) from all datasets.
         """
-        try:
-            # Load the dataset (assuming it's a CSV file)
-            df = pd.read_csv(dataset_path)
-            if 'title' not in df.columns:
-                raise ValueError("Dataset must contain a 'title' column.")
-            
-            # Combine title, cast, and crew into a single string for each movie
-            df['content'] = df['title'] + ' ' + df['cast'].fillna('') + ' ' + df['crew'].fillna('')
+        all_movies = []
 
-            # Use TF-IDF Vectorizer to convert text to numeric vectors
-            tfidf_vectorizer = TfidfVectorizer(stop_words='english')
-            tfidf_matrix = tfidf_vectorizer.fit_transform(df['content'])
+        # Get all datasets from the database
+        datasets = Dataset.objects.all()
 
-            # Check if the movie title exists in the dataset
-            if movie_title.lower() not in df['title'].str.lower().values:
-                return []
+        # Iterate through all datasets and extract movie data
+        for dataset in datasets:
+            try:
+                # Open the CSV file associated with the current dataset
+                with dataset.file.open('r') as csvfile:
+                    reader = csv.DictReader(csvfile)
 
-            # Compute cosine similarity between the provided movie title and the entire dataset
-            movie_idx = df[df['title'].str.lower() == movie_title.lower()].index[0]
-            cosine_sim = cosine_similarity(tfidf_matrix[movie_idx], tfidf_matrix).flatten()
+                    # Iterate through each row in the CSV file
+                    for row in reader:
+                        # Get movie_id and title for each row in the CSV
+                        movie_id = row.get("movie_id")
+                        title = row.get("title")
 
-            # Get the indices of the most similar movies
-            similar_indices = cosine_sim.argsort()[-6:-1][::-1]  # Top 5 similar movies
+                        # Only add to the list if both movie_id and title exist
+                        if movie_id and title:
+                            all_movies.append({
+                                "movie_id": movie_id,
+                                "title": title
+                            })
 
-            # Return the movie titles
-            recommendations = df['title'].iloc[similar_indices].tolist()
-            return recommendations
+            except Exception as e:
+                # Return an error response if there's an issue with reading the CSV file
+                return Response({
+                    "error": "Failed to read the dataset file.",
+                    "details": str(e)
+                }, status=400)
 
-        except Exception as e:
-            raise ValueError(f"Error during recommendation generation: {str(e)}")
+        # Return the list of all movies from all datasets
+        return Response(all_movies)
 
+def fetch_poster(movie_id):
+    url = "https://api.themoviedb.org/3/movie/{}?api_key=8265bd1679663a7ea12ac168da84d2e8&language=en-US".format(movie_id)
+    try:
+        data = requests.get(url)
+        data.raise_for_status()
+        data = data.json()
+        poster_path = data.get('poster_path')
+        if poster_path:
+            return "https://image.tmdb.org/t/p/w500/" + poster_path
+        else:
+            return None
+    except requests.exceptions.RequestException:
+        return None
 
 class MovieSuggestView(APIView):
     def get(self, request, *args, **kwargs):
-        """
-        Suggest movie titles based on partial input.
-        """
-        query = request.query_params.get('query', '').lower()
+        # Ensure a movie ID is passed in the query params
+        movie_id = request.query_params.get('movie_id')
+        if not movie_id:
+            return Response({"error": "movie_id query parameter is required."}, status=status.HTTP_400_BAD_REQUEST)
 
-        # Validate that the query is provided
-        if not query:
-            return Response({"error": "Query is required as a parameter."}, status=status.HTTP_400_BAD_REQUEST)
+        # Get the dataset file
+        dataset_obj = Dataset.objects.first()
+        if not dataset_obj:
+            return Response({"error": "Dataset not found."}, status=status.HTTP_404_NOT_FOUND)
 
+        # Load the dataset CSV
+        file_path = dataset_obj.file.path
         try:
-            # Fetch all datasets from the database
-            datasets = Dataset.objects.all()
-            suggestions = []
-
-            for dataset in datasets:
-                dataset_path = dataset.file.path
-                df = pd.read_csv(dataset_path)
-
-                if 'title' not in df.columns:
-                    continue  # Skip datasets that do not contain a 'title' column
-                
-                # Suggest titles that match the query
-                matching_titles = df['title'][df['title'].str.contains(query, case=False)].head(10).tolist()
-                suggestions.extend(matching_titles)
-
-            # Return unique suggestions, if any
-            if suggestions:
-                return Response({"suggestions": list(set(suggestions))}, status=status.HTTP_200_OK)
-            else:
-                return Response({"error": "No suggestions found."}, status=status.HTTP_404_NOT_FOUND)
-
+            df = pd.read_csv(file_path)
         except Exception as e:
-            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({"error": f"Failed to load dataset: {str(e)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        # Validate required columns
+        required_columns = {'movie_id', 'title', 'cast', 'crew'}
+        if not required_columns.issubset(df.columns):
+            return Response({"error": f"Dataset must contain columns: {required_columns}"}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Function to extract cast names from the nested 'cast' column
+        def extract_cast_names(cast_column):
+            try:
+                cast_data = json.loads(cast_column)  # assuming the 'cast' column is a JSON string
+                return ' '.join([actor['name'] for actor in cast_data if 'name' in actor])
+            except (json.JSONDecodeError, TypeError):
+                return ''
+
+        # Function to extract crew roles from the nested 'crew' column
+        def extract_crew_roles(crew_column):
+            try:
+                crew_data = json.loads(crew_column)  # assuming the 'crew' column is a JSON string
+                return ' '.join([crew_member['name'] for crew_member in crew_data if 'name' in crew_member])
+            except (json.JSONDecodeError, TypeError):
+                return ''
+
+        # Apply the extraction functions to the cast and crew columns
+        df['cast_names'] = df['cast'].apply(extract_cast_names)
+        df['crew_roles'] = df['crew'].apply(extract_crew_roles)
+
+        # Combine relevant fields into a single text column
+        df['combined'] = df['title'].fillna('') + ' ' + df['cast_names'].fillna('') + ' ' + df['crew_roles'].fillna('')
+
+        # Check if movie_id exists in the dataset
+        if int(movie_id) not in df['movie_id'].values:
+            return Response({"error": f"Movie ID {movie_id} not found in the dataset."}, status=status.HTTP_404_NOT_FOUND)
+
+        # Vectorize the combined text
+        tfidf = TfidfVectorizer(stop_words='english')
+        tfidf_matrix = tfidf.fit_transform(df['combined'])
+
+        # Calculate cosine similarity
+        cosine_sim = cosine_similarity(tfidf_matrix)
+
+        # Find the index of the given movie_id
+        movie_idx = df[df['movie_id'] == int(movie_id)].index[0]
+
+        # Get similarity scores for the given movie
+        sim_scores = list(enumerate(cosine_sim[movie_idx]))
+        sim_scores = sorted(sim_scores, key=lambda x: x[1], reverse=True)
+
+        # Retrieve top recommendations (excluding the movie itself)
+        top_recommendations = sim_scores[1:6]  # Top 5 similar movies
+        recommendations = []
+        for idx, score in top_recommendations:
+            recommended_movie = df.iloc[idx]
+            # Fetch poster (add your fetch_poster logic here)
+            poster_url = fetch_poster(recommended_movie['movie_id'])
+
+            # Add the recommendation to the list
+            recommendations.append({
+                "movie_id": recommended_movie['movie_id'],
+                "title": recommended_movie['title'],
+                "poster_url": poster_url,
+                "similarity_score": score
+            })
+
+        # Return recommendations
+        return Response({"movie_id": movie_id, "recommendations": recommendations}, status=status.HTTP_200_OK)
